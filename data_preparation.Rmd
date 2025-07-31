@@ -1,0 +1,41 @@
+---
+title: "data_preparation_"
+author: "collins"
+date: "2025-07-31"
+output: html_document
+---
+
+```{r}
+#load the dataframe containing the NDVI data and the covariates 
+data <- read_csv("~//Documents//Analysis//output_data//forests_pixel_ndvi_temp_precip_hm_time_series.csv")
+
+#unique names in area_name column
+unique_names_all <- unique(data$area_name)
+print(unique_names_all)
+#Get a sample of the first 5 columns 
+head(data)
+
+#Subset data from the gardenroute and create a new dataframe 
+Garden_Route_data <- subset(data, grepl("garden route", area_name, ignore.case = TRUE))
+
+
+# You can now view the new, subsetted data frame
+head(Garden_Route_data)
+# Save the subsetted data to a CSV file
+write.csv(Garden_Route_data, "Garden_Route_data.csv", row.names = FALSE)
+# Check csv file 
+check_data <- read.csv("Garden_Route_data.csv")
+
+#Create a second dataframe of another reserve 
+Mphaphuli_Protected_data <- subset(data, grepl("Mphaphuli Protected", area_name, ignore.case = TRUE))
+
+# You can now view the new, subsetted data frame
+head(Mphaphuli_Protected_data)
+# Save the subsetted data to a CSV file
+write.csv(Mphaphuli_Protected_data, "Mphaphuli_Protected_data.csv", row.names = FALSE)
+
+ #Check csv file 
+check_data <- read.csv("Mphaphuli_Protected_data.csv")
+
+```
+
