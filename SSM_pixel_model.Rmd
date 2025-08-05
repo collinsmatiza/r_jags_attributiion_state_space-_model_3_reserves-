@@ -1,0 +1,441 @@
+---
+title: "SSM_pixel_model"
+author: "collins"
+date: "2025-08-05"
+output: html_document
+---
+
+`
+```{r}
+# Load necessary libraries
+
+library(rjags)
+library(coda)
+library(Rgraphviz)
+library(graph)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+# =============================================================================
+# NDVI State-Space Model with Seasonality, Elevation, GHM, and Robust Plotting
+# =============================================================================
+
+set.seed(42) # For reproducibility
+
+# --- Utility Functions for Parameter Extraction ---
+extract_param <- function(param_matrix, param_name) {
+  if(param_name %in% colnames(param_matrix)) {
+    return(median(param_matrix[, param_name], na.rm = TRUE))
+  } else {
+    warning(sprintf("Parameter '%s' not found", param_name))
+    return(NA)
+  }
+}
+
+extract_param_ci <- function(param_matrix, param_name) {
+  if(param_name %in% colnames(param_matrix)) {
+    return(quantile(param_matrix[, param_name], c(0.025, 0.975), na.rm = TRUE))
+  } else {
+    warning(sprintf("Parameter '%s' not found", param_name))
+    return(c(NA, NA))
+  }
+}
+
+# --- 1. Data Preparation ---
+pixel_2_data <- subset(sub_data, pixel_id == 2)
+
+# Time series plot for sanity check
+op <- par(no.readonly = TRUE) # Save current graphics settings
+par(mfrow = c(1, 1), mar = c(4, 4, 2, 1))
+plot(pixel_2_data$date, pixel_2_data$NDVI,
+     type = "b", main = "NDVI Time Series for Pixel ID 2 (1982-2020)",
+     xlab = "Date", ylab = "NDVI", col = "blue", pch = 19)
+par(op) # Restore settings
+
+
+
+# --- DAG Libraries and DAG Plot with Rgraphviz ---
+cat("=== CAUSAL DAG FOR NDVI STATE-SPACE MODEL WITH SEASONALITY, GHM, and ELEVATION ===\n")
+cat("DAG Structure:\n")
+cat("
+Precipitation(t) ──────┐
+                       ▼
+Temperature(t) ────► NDVI_true(t) ────► NDVI_obs(t)
+                       ▲
+NDVI_true(t-1) ────────┼─────── Seasonality(t)
+                       │
+GHM(t) ────────────────┤
+Elevation ─────────────┤
+Process_Error(t) ──────┘
+Obs_Error(t) ───────────────► NDVI_obs(t)
+")
+
+# Rgraphviz DAG
+if (!requireNamespace("Rgraphviz", quietly = TRUE)) {
+  if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+  BiocManager::install("Rgraphviz")
+}
+
+
+# Define nodes including GHM and Elevation
+nodes <- c(
+  "Precipitation", "Temperature", "NDVI_t_1", "Seasonality", "GHM", "Elevation",
+  "NDVI_t", "NDVI_observed", "ProcessError", "ObservationError"
+)
+
+# Define edges for each node (must match order/length of nodes)
+edgeList <- list(
+  Precipitation    = list(edges = "NDVI_t"),
+  Temperature      = list(edges = "NDVI_t"),
+  NDVI_t_1         = list(edges = "NDVI_t"),
+  Seasonality      = list(edges = "NDVI_t"),
+  GHM              = list(edges = "NDVI_t"),
+  Elevation        = list(edges = "NDVI_t"),
+  NDVI_t           = list(edges = "NDVI_observed"),
+  NDVI_observed    = list(edges = character(0)),        # no outgoing edges
+  ProcessError     = list(edges = "NDVI_t"),
+  ObservationError = list(edges = "NDVI_observed")
+)
+edgeList <- edgeList[nodes]
+dag_graph <- new("graphNEL", nodes = nodes, edgeL = edgeList, edgemode = "directed")
+plot(dag_graph, main = "NDVI State-Space Model DAG with Seasonality, GHM, Elevation (Rgraphviz)")
+
+cat("\n=== MATHEMATICAL MODEL STRUCTURE WITH SEASONALITY, GHM, ELEVATION ===\n")
+cat("
+Process Model: NDVI_t = γ + φ(NDVI_{t-1} - γ) + β_rain × log(Precipitation_t + 1) +
+               β_temp × Temperature_std_t + β_elev × Elevation_std + β_ghm × GHM_std_t +
+               α_1 × cos(2π × t/12) + α_2 × sin(2π × t/12) + ε_t
+Observation Model: NDVI_observed_t = NDVI_t + η_t
+Priors: See code
+")
+
+# --- 3. Data Preparation ---
+data <- pixel_2_data
+ndvi <- pixel_2_data$NDVI
+n <- length(ndvi)
+cat("Total length of ndvi:", n, "\n")
+
+cat(sprintf("NDVI range: %.3f to %.3f\n", min(ndvi, na.rm = TRUE), max(ndvi, na.rm = TRUE)))
+if(min(ndvi, na.rm = TRUE) < -1 || max(ndvi, na.rm = TRUE) > 1) {
+  warning("NDVI values outside expected range [-1, 1]. Check data preprocessing.")
+}
+ndvi_new <- ndvi
+
+if("date" %in% names(pixel_2_data)) {
+  dates <- as.Date(pixel_2_data$date)
+  months <- as.numeric(format(dates, "%m"))
+} else {
+  months <- rep(1:12, length.out = n)
+}
+cos_month <- cos(2 * pi * months / 12)
+sin_month <- sin(2 * pi * months / 12)
+
+rain <- if("Precipitation_mm" %in% names(pixel_2_data)) {
+  pixel_2_data$Precipitation_mm
+} else {
+  warning("Precipitation data not found, using dummy data.")
+  rnorm(n, mean = 50, sd = 20)
+}
+if(length(rain) < n) rain <- rep(rain, length.out = n)
+
+temp <- if("Temperature_C" %in% names(pixel_2_data)) {
+  pixel_2_data$Temperature_C
+} else {
+  warning("Temperature data not found, using dummy data.")
+  rnorm(n, mean = 20, sd = 5)
+}
+if(length(temp) < n) temp <- rep(temp, length.out = n)
+temp_std <- (temp - mean(temp, na.rm = TRUE)) / sd(temp, na.rm = TRUE)
+
+if("Elevation_m" %in% names(pixel_2_data)) {
+  elevation <- pixel_2_data$Elevation_m[1]
+  elevation_std <- rep((elevation - mean(pixel_2_data$Elevation_m, na.rm = TRUE)) /
+                       sd(pixel_2_data$Elevation_m, na.rm = TRUE), n)
+} else {
+  warning("Elevation data not found, using dummy data.")
+  elevation_std <- rep(0, n)
+}
+
+ghm <- if("GHM" %in% names(pixel_2_data)) {
+  pixel_2_data$GHM
+} else {
+  warning("GHM data not found, using dummy data.")
+  seq(0.1, 0.3, length.out = n) + rnorm(n, 0, 0.05)
+}
+if(length(ghm) < n) ghm <- rep(ghm, length.out = n)
+ghm <- pmax(0, pmin(1, ghm))
+ghm_std <- (ghm - mean(ghm, na.rm = TRUE)) / sd(ghm, na.rm = TRUE)
+
+stopifnot(all.equal(length(ndvi), length(rain), length(temp_std),
+                    length(elevation_std), length(ghm_std),
+                    length(cos_month), length(sin_month)))
+
+# --- 4. Robust Exploratory Plots ---
+op <- par(no.readonly = TRUE) # save current settings
+
+par(mfrow = c(3, 1), mar = c(4, 4, 2, 1))
+plot.ts(rain, main = "Precipitation (Causal Driver → NDVI)", ylab = "Precipitation (mm)")
+plot.ts(temp, main = "Temperature (Causal Driver → NDVI)", ylab = "Temperature (°C)")
+plot.ts(elevation_std, main = "Elevation (Static Covariate → NDVI)", ylab = "Std. Elevation")
+par(op)
+
+par(mfrow = c(3, 1), mar = c(4, 4, 2, 1))
+plot.ts(ghm, main = "GHM - Global Human Modification (Dynamic → NDVI)", ylab = "GHM")
+plot.ts(ndvi, main = "NDVI (Response Variable)", ylab = "NDVI")
+plot.ts(cos_month, main = "Seasonal Component: cos(2π×month/12)", ylab = "cos(month)")
+par(op)
+
+par(mfrow = c(1, 1), mar = c(4, 4, 2, 1))
+plot.ts(sin_month, main = "Seasonal Component: sin(2π×month/12)", ylab = "sin(month)")
+par(op)
+
+# --- Save all 7 plots to file safely ---
+png("ndvi_exploratory_plots.png", width = 1200, height = 2100)
+par(mfrow = c(7, 1), mar = c(3, 4, 2, 1))
+plot.ts(rain, main = "Precipitation (Causal Driver → NDVI)", ylab = "Precipitation (mm)")
+plot.ts(temp, main = "Temperature (Causal Driver → NDVI)", ylab = "Temperature (°C)")
+plot.ts(elevation_std, main = "Elevation (Static Covariate → NDVI)", ylab = "Std. Elevation")
+plot.ts(ghm, main = "GHM - Global Human Modification (Dynamic → NDVI)", ylab = "GHM")
+plot.ts(ndvi, main = "NDVI (Response Variable)", ylab = "NDVI")
+plot.ts(cos_month, main = "Seasonal Component: cos(2π×month/12)", ylab = "cos(month)")
+plot.ts(sin_month, main = "Seasonal Component: sin(2π×month/12)", ylab = "sin(month)")
+dev.off()
+cat("Plots saved to ndvi_exploratory_plots.png\n")
+
+# --- 5. JAGS Model Setup ---
+data_jags <- list(
+  y = ndvi_new,
+  n = n,
+  VPD = (rain + 1),
+  Temp_std = temp_std,
+  Elev_std = elevation_std,
+  GHM_std = ghm_std,
+  cos_month = cos_month,
+  sin_month = sin_month,
+  x_ic = mean(ndvi, na.rm = TRUE),
+  tau_ic = 100,
+  a_obs = 1,
+  r_obs = 1,
+  a_add = 1,
+  r_add = 1
+)
+
+nchain <- 3
+init <- lapply(1:nchain, function(i) {
+  list(
+    tau_add = 1 / var(diff(ndvi), na.rm = TRUE),
+    tau_obs = 5 / var(ndvi, na.rm = TRUE),
+    beta_rain = rnorm(1, 0, 0.1),
+    beta_temp = rnorm(1, 0, 0.1),
+    beta_elev = rnorm(1, 0, 0.1),
+    beta_ghm = rnorm(1, 0, 0.1),
+    alpha_1 = rnorm(1, 0, 0.1),
+    alpha_2 = rnorm(1, 0, 0.1),
+    gamma = rnorm(1, mean(ndvi, na.rm = TRUE), 0.1),
+    phi = runif(1, 0.5, 0.95)
+  )
+})
+
+rmodel <- "
+model{
+  tau_add ~ dgamma(a_add, r_add)
+  tau_obs ~ dgamma(a_obs, r_obs)
+  beta_rain ~ dnorm(0, 1)
+  beta_temp ~ dnorm(0, 1)
+  beta_elev ~ dnorm(0, 1)
+  beta_ghm ~ dnorm(0, 1)
+  alpha_1 ~ dnorm(0, 1)
+  alpha_2 ~ dnorm(0, 1)
+  gamma ~ dnorm(x_ic, 1)
+  phi ~ dunif(0, 1)
+  x[1] ~ dnorm(x_ic, tau_ic)
+  for(t in 2:n) {
+    mu[t] <- gamma + phi * (x[t-1] - gamma) +
+             beta_rain * VPD[t] +
+             beta_temp * Temp_std[t] +
+             beta_elev * Elev_std[t] +
+             beta_ghm * GHM_std[t] +
+             alpha_1 * cos_month[t] +
+             alpha_2 * sin_month[t]
+    x[t] ~ dnorm(mu[t], tau_add)
+  }
+  for(t in 1:n) {
+    y[t] ~ dnorm(x[t], tau_obs)
+  }
+  sigma_add <- pow(tau_add, -0.5)
+  sigma_obs <- pow(tau_obs, -0.5)
+  snr <- sigma_obs / sigma_add
+  seasonal_amplitude <- sqrt(alpha_1^2 + alpha_2^2)
+}
+"
+
+cat("\n=== FITTING BAYESIAN STATE-SPACE MODEL WITH SEASONALITY ===\n")
+j.model <- jags.model(textConnection(rmodel), data = data_jags, inits = init, n.chains = nchain)
+update(j.model, n.iter = 10000)
+
+jags.out <- coda.samples(j.model,
+  variable.names = c("tau_add", "tau_obs", "beta_rain", "beta_temp", 
+                     "beta_elev", "beta_ghm", "alpha_1", "alpha_2", "gamma", "phi", 
+                     "sigma_add", "sigma_obs", "snr", "seasonal_amplitude"),
+  n.iter = 30000
+)
+plot(jags.out)
+print(gelman.diag(jags.out))
+
+jags.out.states <- coda.samples(j.model,
+  variable.names = c("x", "tau_add", "tau_obs", "beta_rain", "beta_temp", 
+                     "beta_elev", "beta_ghm", "alpha_1", "alpha_2", "gamma", "phi"),
+  n.iter = 30000
+)
+
+# --- 6. Model Results and Diagnostics ---
+param_summary <- summary(jags.out)
+print("=== PARAMETER ESTIMATES WITH SEASONALITY ===")
+print(param_summary)
+
+years <- seq(1982, 2020, length.out = n)
+tt <- 1:n
+out <- as.matrix(jags.out.states)
+x.cols <- grep("^x", colnames(out))
+ci <- apply(out[, x.cols], 2, quantile, c(0.025, 0.5, 0.975))
+
+pred_mean <- apply(out[, x.cols], 2, mean)
+pred_lower <- apply(out[, x.cols], 2, quantile, 0.025)
+pred_upper <- apply(out[, x.cols], 2, quantile, 0.975)
+
+param_matrix <- as.matrix(jags.out)
+alpha_1_mean <- mean(param_matrix[, "alpha_1"])
+alpha_2_mean <- mean(param_matrix[, "alpha_2"])
+seasonal_component <- alpha_1_mean * cos_month + alpha_2_mean * sin_month
+
+comparison_df <- data.frame(
+  Year = years,
+  Time_Index = tt,
+  Month = months,
+  Observed = ndvi,
+  Predicted = pred_mean,
+  Lower_CI = pred_lower,
+  Upper_CI = pred_upper,
+  Seasonal_Component = seasonal_component,
+  Residual = ndvi - pred_mean,
+  Within_CI = (ndvi >= pred_lower & ndvi <= pred_upper)
+)
+
+# Performance metrics
+obs_values <- ndvi
+pred_values <- pred_mean
+rmse_obs <- sqrt(mean((obs_values - pred_values)^2, na.rm = TRUE))
+mae_obs <- mean(abs(obs_values - pred_values), na.rm = TRUE)
+r2_obs <- cor(obs_values, pred_values, use = "complete.obs")^2
+coverage <- mean(comparison_df$Within_CI, na.rm = TRUE)
+
+cat("\n=== MODEL PERFORMANCE METRICS ===\n")
+cat(sprintf("RMSE: %.4f\n", rmse_obs))
+cat(sprintf("MAE: %.4f\n", mae_obs))
+cat(sprintf("R-squared: %.4f\n", r2_obs))
+cat(sprintf("95%% CI Coverage: %.1f%%\n", coverage * 100))
+cat(sprintf("Predicted NDVI range: %.3f to %.3f\n", min(pred_mean, na.rm = TRUE), max(pred_mean, na.rm = TRUE)))
+
+# --- 7. Visualization ---
+op <- par(no.readonly = TRUE)
+par(mfrow = c(4, 2), mar = c(4, 4, 3, 2))
+plot(years, ci[2,], type = 'n', ylab = "NDVI", xlab = "Year",
+     ylim = range(c(ci, ndvi), na.rm = TRUE),
+     main = "NDVI State-Space Model\n(Seasonality + Elevation + GHM)")
+polygon(c(years, rev(years)), c(ci[1,], rev(ci[3,])),
+        col = rgb(0.7, 0.7, 1, 0.5), border = NA)
+points(years, ndvi, pch = 16, cex = 0.5, col = "black")
+lines(years, pred_mean, col = "red", lwd = 2)
+legend("topleft", bty = "n", col = c("black", "red", "lightblue"),
+       legend = c("Observed", "Predicted", "95% CI"),
+       lwd = c(1, 2, 5), lty = c(1, 1, 1), pch = c(16, NA, NA))
+
+plot(years, ghm, type = "l", col = "brown", lwd = 2,
+     xlab = "Year", ylab = "GHM", main = "Global Human Modification\nTrend over Time")
+
+plot(pred_values, obs_values, xlab = "Predicted NDVI", ylab = "Observed NDVI",
+     main = "Model Validation\n(Full Covariate Model)",
+     pch = 16, col = rgb(0, 0, 0, 0.6))
+abline(0, 1, col = "red", lwd = 2)
+abline(lm(obs_values ~ pred_values), col = "blue", lwd = 2)
+text(min(pred_values, na.rm = TRUE), max(obs_values, na.rm = TRUE),
+     paste("R² =", round(r2_obs, 3)), adj = c(0, 1))
+
+plot(rain, comparison_df$Residual, xlab = "Precipitation (mm)", ylab = "Model Residuals",
+     main = "Precipitation Effect\n(β_rain from DAG)", pch = 16, col = rgb(0, 0, 1, 0.6))
+abline(h = 0, col = "red", lwd = 2)
+
+plot(ghm_std, comparison_df$Residual, xlab = "Standardized GHM", ylab = "Model Residuals",
+     main = "Human Modification Effect\n(β_ghm from DAG)", pch = 16, col = rgb(0.6, 0.3, 0, 0.6))
+abline(h = 0, col = "red", lwd = 2)
+
+plot(years, comparison_df$Residual, xlab = "Year", ylab = "Residuals",
+     main = "Temporal Residual Pattern", pch = 16, col = rgb(0, 0, 0, 0.6))
+abline(h = 0, col = "red", lwd = 2)
+lines(lowess(years, comparison_df$Residual), col = "blue", lwd = 2)
+
+boxplot(param_matrix[, c("beta_rain", "beta_temp", "beta_elev", "beta_ghm", "alpha_1", "alpha_2")],
+        main = "Posterior Distributions\nof All Coefficients",
+        ylab = "Coefficient Value",
+        names = c("β_rain", "β_temp", "β_elev", "β_ghm", "α₁", "α₂"),
+        col = c("lightblue", "lightcoral", "lightgreen", "brown", "yellow", "orange"),
+        las = 2)
+abline(h = 0, col = "red", lwd = 2, lty = 2)
+
+plot(years, ndvi, type = "l", col = "black", lwd = 1, main = "NDVI Decomposition", ylab = "NDVI", xlab = "Year")
+lines(years, pred_mean - seasonal_component, col = "blue", lwd = 2, lty = 2)
+lines(years, seasonal_component + mean(ndvi, na.rm = TRUE), col = "green", lwd = 2, lty = 3)
+legend("topleft", bty = "n", col = c("black", "blue", "green"),
+       legend = c("Observed", "Trend + Climate", "Seasonal"),
+       lwd = c(1, 2, 2), lty = c(1, 2, 3))
+par(op)
+
+# --- 8. DAG-Informed Interpretation ---
+cat("\n=== DAG-INFORMED MODEL INTERPRETATION ===\n")
+
+beta_rain_est <- extract_param(param_matrix, "beta_rain")
+beta_temp_est <- extract_param(param_matrix, "beta_temp")
+beta_elev_est <- extract_param(param_matrix, "beta_elev")
+beta_ghm_est <- extract_param(param_matrix, "beta_ghm")
+alpha_1_est <- extract_param(param_matrix, "alpha_1")
+alpha_2_est <- extract_param(param_matrix, "alpha_2")
+gamma_est <- extract_param(param_matrix, "gamma")
+phi_est <- extract_param(param_matrix, "phi")
+seasonal_amp <- extract_param(param_matrix, "seasonal_amplitude")
+seasonal_phase <- if(!is.na(alpha_1_est) && !is.na(alpha_2_est)) atan2(alpha_2_est, alpha_1_est) else NA
+
+beta_rain_ci <- extract_param_ci(param_matrix, "beta_rain")
+beta_temp_ci <- extract_param_ci(param_matrix, "beta_temp")
+beta_elev_ci <- extract_param_ci(param_matrix, "beta_elev")
+beta_ghm_ci <- extract_param_ci(param_matrix, "beta_ghm")
+alpha_1_ci <- extract_param_ci(param_matrix, "alpha_1")
+alpha_2_ci <- extract_param_ci(param_matrix, "alpha_2")
+
+cat("\nCausal Effects:\n")
+cat(sprintf("Precipitation → NDVI: β_rain = %.4f [%.4f, %.4f]\n", beta_rain_est, beta_rain_ci[1], beta_rain_ci[2]))
+cat(sprintf("Temperature → NDVI: β_temp = %.4f [%.4f, %.4f]\n", beta_temp_est, beta_temp_ci[1], beta_temp_ci[2]))
+cat(sprintf("Elevation → NDVI: β_elev = %.4f [%.4f, %.4f]\n", beta_elev_est, beta_elev_ci[1], beta_elev_ci[2]))
+cat(sprintf("Human Modification → NDVI: β_ghm = %.4f [%.4f, %.4f]\n", beta_ghm_est, beta_ghm_ci[1], beta_ghm_ci[2]))
+cat(sprintf("Seasonal cosine: α₁ = %.4f [%.4f, %.4f]\n", alpha_1_est, alpha_1_ci[1], alpha_1_ci[2]))
+cat(sprintf("Seasonal sine: α₂ = %.4f [%.4f, %.4f]\n", alpha_2_est, alpha_2_ci[1], alpha_2_ci[2]))
+cat(sprintf("Seasonal amplitude: %.4f\n", seasonal_amp))
+if(!is.na(seasonal_phase)) {
+  cat(sprintf("Seasonal phase (radians): %.4f\n", seasonal_phase))
+  cat(sprintf("Peak season (month): %.1f\n", ((seasonal_phase + pi/2) * 12 / (2*pi)) %% 12 + 1))
+}
+cat(sprintf("Long-term mean NDVI: γ = %.4f\n", gamma_est))
+cat(sprintf("Mean reversion parameter: φ = %.4f\n", phi_est))
+
+cat("\nInterpretation:\n")
+if(!is.na(beta_rain_est)) cat(ifelse(beta_rain_est > 0, "• Increased precipitation leads to higher NDVI\n", "• Increased precipitation leads to lower NDVI\n"))
+if(!is.na(beta_temp_est)) cat(ifelse(beta_temp_est > 0, "• Higher temperatures promote vegetation growth\n", "• Higher temperatures stress vegetation\n"))
+if(!is.na(beta_elev_est)) cat(ifelse(beta_elev_est > 0, "• Higher elevation areas have higher NDVI\n", "• Higher elevation areas have lower NDVI\n"))
+if(!is.na(beta_ghm_est)) cat(ifelse(beta_ghm_est > 0, "• Human modification increases NDVI\n", "• Human modification decreases NDVI\n"))
+cat(sprintf("• Seasonal amplitude: %.3f NDVI units\n", seasonal_amp))
+cat(sprintf("• Mean reversion strength: %.3f (higher = faster return to mean)\n", 1 - phi_est))
+
+write.csv(comparison_df, "ndvi_full_covariate_model_results.csv", row.names = FALSE)
+cat("\nModel results saved to 'ndvi_full_covariate_model_results.csv'\n")
+
+comparison_df
+```
